@@ -454,28 +454,6 @@ def stageable_paths(repo_root: Path, ignored_paths: set[str]) -> list[str]:
     return candidates
 
 
-def ensure_git_excludes(repo_root: Path, task_root: Path) -> None:
-    info_exclude = repo_root / ".git" / "info" / "exclude"
-    info_exclude.parent.mkdir(parents=True, exist_ok=True)
-    existing = info_exclude.read_text(encoding="utf-8") if info_exclude.exists() else ""
-    required = [
-        ".chief-wiggum/",
-        "**/.chief-wiggum/",
-        ".opencode/ralph-loop.local.md",
-        "**/.opencode/ralph-loop.local.md",
-    ]
-    if task_root != repo_root:
-        task_rel = safe_relpath(task_root, repo_root).rstrip("/") + "/"
-        required.append(task_rel)
-    missing = [entry for entry in required if entry not in existing]
-    if missing:
-        prefix = "\n" if existing and not existing.endswith("\n") else ""
-        with info_exclude.open("a", encoding="utf-8") as handle:
-            handle.write(prefix)
-            for entry in missing:
-                handle.write(entry + "\n")
-
-
 @dataclass
 class TaskFile:
     path: Path
@@ -564,6 +542,13 @@ def state_dir(directory: Path) -> Path:
 
 def state_path(directory: Path) -> Path:
     return state_dir(directory) / "state.json"
+
+
+def runtime_ignored_repo_paths(plan_map: dict[Path, DirectoryPlan], repo_root: Path) -> set[str]:
+    ignored: set[str] = set()
+    for directory in plan_map.keys():
+        ignored.add(safe_relpath(directory / ".opencode" / "ralph-loop.local.md", repo_root))
+    return ignored
 
 
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -1070,6 +1055,13 @@ def review_prompt(relative_path: str) -> str:
         Apply any remediation needed directly in the repository.
         If the tree is ready to commit, finish with exactly one line in this form:
         {COMMIT_PREFIX} <concise commit message>
+
+        Note: Do not amend the git config to ignore any files. Use the .gitignore only. 
+        Do not ignore files for the sake of it, only ignore things containing secrets and such ilk. 
+        If you need to ignore files, add them to the .gitignore and commit that change first, then continue with the task. 
+        `.chief-wiggum/state.json` is project state and may be committed when changed.
+        `.opencode/ralph-loop.local.md` is transient runner metadata.
+        Do not add either path to `.gitignore` unless the task explicitly requires it.
         """
     ).strip()
 
@@ -1629,8 +1621,8 @@ def main() -> int:
         for plan in plan_map.values()
         for task in plan.files
     }
+    ignored_repo_paths.update(runtime_ignored_repo_paths(plan_map, repo_root))
 
-    ensure_git_excludes(repo_root, root)
     validate_environment(args, root, repo_root, ignored_repo_paths)
 
     for directory, plan in plan_map.items():
@@ -1644,6 +1636,13 @@ def main() -> int:
         mode="sync" if args.sync_mode else ("dry-run" if args.dry_run else "run"),
         completed_tasks=count_completed_tasks(plan_map),
     )
+    if not args.sync_mode and total_tasks and dashboard_state.completed_tasks >= total_tasks:
+        print(
+            "Chief Wiggum Loop: all runnable task files are already marked done in .chief-wiggum/state.json. "
+            "Clear or edit that state to rerun them, or use sync mode to refresh status.",
+            file=sys.stderr,
+        )
+        return 0
     update_dashboard_directories(root, dashboard_state, plan_map)
     dashboard_state.recent_commits = git_recent_commits(repo_root, limit=5)
     dashboard = Dashboard(dashboard_state)
